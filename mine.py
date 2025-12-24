@@ -1,44 +1,24 @@
+import os
+import json
 import random
 import asyncio
-import json
-import os
 from datetime import datetime, timedelta
-from typing import Dict, Optional
-from enum import Enum
+from typing import Dict
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ChatPermissions
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
-    filters,
-    ContextTypes
+    ContextTypes,
+    filters
 )
 
-# Настройки бота
-TOKEN = "8295186173:AAHkdN2iZOcwLHwu2ItXjYE0ulG_iSdmFo4"
-
 # Константы
+TOKEN = "8295186173:AAHkdN2iZOcwLHwu2ItXjYE0ulG_iSdmFo4"
+DATA_FILE = "user_data.json"
 COINS_PER_WIN = 5
-DATA_FILE = "duel_data.json"
-
-
-# Состояния магазина
-class ShopState(Enum):
-    MAIN = "shop_main"
-    PISTOLS = "shop_pistols"
-    BOWS = "shop_bows"
-    STAFFS = "shop_staffs"
-    MELEE = "shop_melee"
-    SPECIAL = "shop_special"
-    CONFIRM = "shop_confirm"
-
 
 # Класс для хранения данных пользователей
 class UserData:
@@ -2013,16 +1993,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_mute_input(update, context)
 
 
-async def start_background_tasks(context):
-    """Запуск фоновых задач после инициализации бота"""
-    bot = context.bot
-    print(f"✅ Бот @{bot.username} успешно подключен!")
-    print(
-        f"🔗 Ссылка для добавления в чат: https://t.me/{bot.username}?startgroup=true&admin=post_messages+delete_messages+restrict_members")
-    # Запускаем задачу проверки неактивных дуэлей
-    asyncio.create_task(check_inactive_duels(bot))
-
-
 async def check_inactive_duels(bot):
     """Проверяет неактивные дуэли"""
     while True:
@@ -2067,15 +2037,22 @@ def main():
     # Добавляем обработчик сообщений (команда !дуэль и ввод мута)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Запускаем фоновую задачу проверки неактивных дуэлей через job_queue
-    application.job_queue.run_once(start_background_tasks, when=0)
-
     # Запускаем бота
     print("🤖 Бот запущен и готов к дуэлям!")
     print("⚔️ Для вызова на дуэль: ответьте на сообщение командой '!дуэль'")
     print("👤 Для просмотра профиля: !дуэльныйпрофиль")
     print("🛒 Магазин оружия доступен через профиль")
     print("⏳ Идет подключение к Telegram...")
+    
+    # Запускаем фоновую задачу проверки неактивных дуэлей
+    application.create_task = asyncio.create_task
+    # Запускаем задачу в фоне
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        asyncio.create_task(check_inactive_duels(application.bot))
+    else:
+        loop.run_until_complete(check_inactive_duels(application.bot))
+    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
