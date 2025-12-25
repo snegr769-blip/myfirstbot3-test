@@ -238,6 +238,7 @@ class DuelState:
         self.mute_duration_minutes = 5  # стандартное время мута
         self.mute_enabled = True  # включен ли мут по умолчанию
         self.weapon_effects: Dict[str, dict] = {}  # Эффекты оружия для текущих дуэлей
+        self.background_tasks_started = False  # Флаг запуска фоновых задач
 
     def set_mute_duration(self, minutes: int):
         self.mute_duration_minutes = minutes
@@ -2767,19 +2768,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_mute_input(update, context)
 
 
-async def start_background_tasks(context):
-    """Запуск фоновых задач после инициализации бота"""
-    bot = context.bot
-    print(f"✅ Бот @{bot.username} успешно подключен!")
-    print(
-        f"🔗 Ссылка для добавления в чат: https://t.me/{bot.username}?startgroup=true&admin=post_messages+delete_messages+restrict_members")
+async def start_background_tasks():
+    """Запуск фоновых задач"""
     # Запускаем задачу проверки неактивных дуэлей
-    asyncio.create_task(check_inactive_duels(bot))
+    asyncio.create_task(check_inactive_duels())
     # Запускаем задачу проверки неактивных боев с монстрами
-    asyncio.create_task(check_inactive_monster_battles(bot))
+    asyncio.create_task(check_inactive_monster_battles())
 
 
-async def check_inactive_duels(bot):
+async def check_inactive_duels():
     """Проверяет неактивные дуэли"""
     while True:
         await asyncio.sleep(60)  # Проверка каждую минуту
@@ -2795,7 +2792,10 @@ async def check_inactive_duels(bot):
 
                     message = random.choice(SAD_MESSAGES + FUNNY_MESSAGES)
                     try:
-                        await bot.send_message(
+                        # Получаем бота из глобального контекста
+                        from telegram.ext import Application
+                        app = Application.builder().token(TOKEN).build()
+                        await app.bot.send_message(
                             chat_id=chat_id,
                             text=f"⏰ Дуэль автоматически прекращена из-за бездействия!\n{message}"
                         )
@@ -2806,7 +2806,7 @@ async def check_inactive_duels(bot):
             duel_state.duels.pop(chat_id, None)
 
 
-async def check_inactive_monster_battles(bot):
+async def check_inactive_monster_battles():
     """Проверяет неактивные бои с монстрами"""
     while True:
         await asyncio.sleep(60)  # Проверка каждую минуту
@@ -2820,7 +2820,10 @@ async def check_inactive_monster_battles(bot):
                     battles_to_remove.append(chat_id)
 
                     try:
-                        await bot.send_message(
+                        # Получаем бота из глобального контекста
+                        from telegram.ext import Application
+                        app = Application.builder().token(TOKEN).build()
+                        await app.bot.send_message(
                             chat_id=chat_id,
                             text=f"⏰ Бой с монстром автоматически прекращен из-за бездействия!"
                         )
@@ -2831,10 +2834,22 @@ async def check_inactive_monster_battles(bot):
             duel_state.end_monster_battle(chat_id)
 
 
+async def post_init(application: Application):
+    """Функция, которая выполняется после инициализации бота"""
+    print(f"✅ Бот успешно подключен!")
+    print(f"🔗 Ссылка для добавления в чат: https://t.me/{application.bot.username}?startgroup=true&admin=post_messages+delete_messages+restrict_members")
+    
+    # Запускаем фоновые задачи
+    if not duel_state.background_tasks_started:
+        await start_background_tasks()
+        duel_state.background_tasks_started = True
+        print("✅ Фоновые задачи запущены")
+
+
 def main():
     """Основная функция"""
-    # Создаем приложение
-    application = Application.builder().token(TOKEN).build()
+    # Создаем приложение БЕЗ JobQueue
+    application = Application.builder().token(TOKEN).post_init(post_init).build()
 
     # Добавляем обработчики команд
     application.add_handler(CommandHandler("start", start))
@@ -2849,9 +2864,6 @@ def main():
     # Добавляем обработчик сообщений (команда !дуэль и ввод мута)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Запускаем фоновую задачу проверки неактивных дуэлей через job_queue
-    application.job_queue.run_once(start_background_tasks, when=0)
-
     # Запускаем бота
     print("🤖 Бот запущен и готов к дуэлям!")
     print("⚔️ Для вызова на дуэль: ответьте на сообщение командой '!дуэль'")
@@ -2859,6 +2871,7 @@ def main():
     print("👹 Для поиска монстра: /monster, !поискмонстра или кнопка 'Поиск монстра'")
     print("🛒 Магазин оружия доступен через профиль")
     print("⏳ Идет подключение к Telegram...")
+    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
