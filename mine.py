@@ -1,24 +1,102 @@
-import os
-import json
 import random
 import asyncio
+import json
+import os
 from datetime import datetime, timedelta
-from typing import Dict
+from typing import Dict, Optional, List
+from enum import Enum
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ChatPermissions
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
-    ContextTypes,
-    filters
+    filters,
+    ContextTypes
 )
 
-# Константы
+# Настройки бота
 TOKEN = "8295186173:AAHkdN2iZOcwLHwu2ItXjYE0ulG_iSdmFo4"
-DATA_FILE = "user_data.json"
+
+# Константы
 COINS_PER_WIN = 5
+DATA_FILE = "duel_data.json"
+
+# Константы для монстров
+MONSTER_DIFFICULTIES = {
+    "common": {
+        "names": ["Зомби", "Скелет", "Слизень"],
+        "spawn_chance": 50.0,
+        "base_accuracy": 5,
+        "max_accuracy": 25,
+        "base_dodge": 2,
+        "max_dodge": 25,
+        "attack_chance": 50,
+        "accuracy_boost_chance": 25,
+        "dodge_boost_chance": 25,
+        "coin_reward": (50, 100)
+    },
+    "rare": {
+        "names": ["Огр", "Мирмеколеон", "Черт"],
+        "spawn_chance": 35.5,
+        "base_accuracy": 10,
+        "max_accuracy": 40,
+        "base_dodge": 10,
+        "max_dodge": 30,
+        "attack_chance": 55,
+        "accuracy_boost_chance": 20,
+        "dodge_boost_chance": 25,
+        "steal_life_chance": 5,  # 1/20 = 5%
+        "coin_reward": (100, 200)
+    },
+    "mythic": {
+        "names": ["Грифон", "Виверна", "Косматый", "Василиск"],
+        "spawn_chance": 13.5,
+        "base_accuracy": 25,
+        "max_accuracy": 50,
+        "base_dodge": 25,
+        "max_dodge": 50,
+        "attack_chance": 60,
+        "accuracy_boost_chance": 15,
+        "dodge_boost_chance": 15,
+        "knockdown_chance": 10,  # 1/10 = 10%
+        "coin_reward": (200, 400)
+    },
+    "legendary": {
+        "names": ["Дракон", "Аваддон", "Вельзевул"],
+        "spawn_chance": 0.5,
+        "base_accuracy": 50,
+        "max_accuracy": 90,
+        "base_dodge": 50,
+        "max_dodge": 90,
+        "attack_chance": 70,
+        "accuracy_boost_chance": 20,
+        "dodge_boost_chance": 10,
+        "steal_life_chance": 10,  # 1/10 = 10%
+        "coin_reward": (500, 1000)
+    },
+    "treasure": {
+        "spawn_chance": 0.5,
+        "coin_reward": (100, 300)
+    }
+}
+
+# Состояния магазина
+class ShopState(Enum):
+    MAIN = "shop_main"
+    PISTOLS = "shop_pistols"
+    BOWS = "shop_bows"
+    STAFFS = "shop_staffs"
+    MELEE = "shop_melee"
+    SPECIAL = "shop_special"
+    CONFIRM = "shop_confirm"
+
 
 # Класс для хранения данных пользователей
 class UserData:
@@ -31,6 +109,33 @@ class UserData:
         self.weapons = ["standard_musket"]  # Начинаем со стандартного мушкета
         self.current_weapon = "standard_musket"
         self.purchases = {}
+        self.monster_kills = {
+            "common": 0,
+            "rare": 0,
+            "mythic": 0,
+            "legendary": 0,
+            "treasure": 0
+        }
+
+
+# Класс для монстров
+class Monster:
+    def __init__(self, difficulty: str):
+        self.difficulty = difficulty
+        self.config = MONSTER_DIFFICULTIES[difficulty]
+        
+        if difficulty == "treasure":
+            self.name = "Клад"
+        else:
+            self.name = random.choice(self.config["names"])
+            
+        self.accuracy = self.config.get("base_accuracy", 0)
+        self.dodge = self.config.get("base_dodge", 0)
+        self.lives = 1
+        self.is_dodge_boosted = False
+        self.is_accuracy_boosted = False
+        self.has_extra_life = False
+        self.knockdown_cooldown = False
 
 
 # Глобальные хранилища данных
@@ -92,6 +197,13 @@ class DataStore:
         user_data.total_losses += 1
         self.save_data()
 
+    def add_monster_kill(self, user_id: int, difficulty: str):
+        """Добавляет убийство монстра пользователю"""
+        user_data = self.get_user_data(user_id)
+        if difficulty in user_data.monster_kills:
+            user_data.monster_kills[difficulty] += 1
+            self.save_data()
+
     def has_weapon(self, user_id: int, weapon_id: str) -> bool:
         """Проверяет, есть ли у пользователя оружие"""
         user_data = self.get_user_data(user_id)
@@ -116,10 +228,11 @@ class DataStore:
 data_store = DataStore()
 
 
-# Состояния дуэлей
+# Состояния дуэлей и боев с монстрами
 class DuelState:
     def __init__(self):
         self.duels: Dict[int, dict] = {}  # chat_id -> duel_info
+        self.monster_battles: Dict[int, dict] = {}  # chat_id -> monster_battle_info
         self.user_mutes: Dict[int, datetime] = {}  # user_id -> mute_until
         self.mute_tasks: Dict[int, asyncio.Task] = {}  # user_id -> задача таймера
         self.mute_duration_minutes = 5  # стандартное время мута
@@ -165,6 +278,26 @@ class DuelState:
         keys_to_remove = [k for k in self.weapon_effects.keys() if k.startswith(f"{duel_id}_")]
         for key in keys_to_remove:
             del self.weapon_effects[key]
+
+    def start_monster_battle(self, chat_id: int, user_id: int, monster: Monster):
+        """Начинает бой с монстром"""
+        self.monster_battles[chat_id] = {
+            'user_id': user_id,
+            'monster': monster,
+            'state': 'active',
+            'created_at': datetime.now(),
+            'last_action': datetime.now(),
+            'user_aim': 0,
+            'user_air_shots': 3,
+            'user_lives': 1,
+            'user_accuracy_modifier': 1.0,
+            'turn': 'user'  # Пользователь ходит первым
+        }
+
+    def end_monster_battle(self, chat_id: int):
+        """Завершает бой с монстром"""
+        if chat_id in self.monster_battles:
+            del self.monster_battles[chat_id]
 
 
 duel_state = DuelState()
@@ -380,6 +513,41 @@ SPECIAL_ACCURACY = {
     0: 10, 1: 25, 2: 50, 3: 75, 4: 90, 5: 100
 }
 
+# Сообщения для монстров
+MONSTER_MESSAGES = {
+    "spawn": [
+        "👹 Из темноты появляется {name}! Приготовьтесь к битве!",
+        "🐾 На вас напал {name}! Защищайтесь!",
+        "👁️ {name} замечает вас и готовится к атаке!",
+        "🌫️ Из тумана возникает {name}... Битва неизбежна!",
+        "⚔️ {name} бросает вам вызов! Сражайтесь или бегите!"
+    ],
+    "treasure": [
+        "💰 Вы нашли клад! Поздравляем!",
+        "🎁 Неожиданная удача! Перед вами клад!",
+        "💎 Блеск вдалеке оказывается сокровищем!",
+        "🏆 Вы обнаружили спрятанные сокровища!"
+    ],
+    "attack": [
+        "{name} атакует вас!",
+        "{name} совершает выпад!",
+        "{name} пытается нанести удар!",
+        "Осторожно! {name} атакует!"
+    ],
+    "dodge": [
+        "{name} уворачивается от вашей атаки!",
+        "{name} ловко избегает удара!",
+        "Ваша атака не достигает цели - {name} слишком быстр!",
+        "{name} показывает мастерство уклонения!"
+    ],
+    "boost": [
+        "{name} готовится к увороту!",
+        "{name} сосредотачивается для уклонения!",
+        "{name} увеличивает свою ловкость!",
+        "{name} становится более уворотливым!"
+    ]
+}
+
 
 def format_username(user):
     """Форматирует имя пользователя для отображения"""
@@ -389,6 +557,26 @@ def format_username(user):
         return user.first_name
     else:
         return f"ID{user.id}"
+
+
+def spawn_monster() -> Optional[Monster]:
+    """Создает случайного монстра на основе вероятностей"""
+    rand = random.random() * 100
+    
+    # Определяем тип монстра
+    current_chance = 0
+    for difficulty, config in MONSTER_DIFFICULTIES.items():
+        current_chance += config["spawn_chance"]
+        if rand <= current_chance:
+            if difficulty == "treasure":
+                # Для клада создаем особый объект
+                monster = Monster("treasure")
+                return monster
+            else:
+                monster = Monster(difficulty)
+                return monster
+    
+    return None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -407,11 +595,545 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("📖 Руководство", callback_data="guide"),
             InlineKeyboardButton("👤 Профиль", callback_data="profile")
+        ],
+        [
+            InlineKeyboardButton("👹 Поиск монстра", callback_data="search_monster")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(greeting, reply_markup=reply_markup)
+
+
+async def monster_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /monster"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    # Проверяем, не идет ли уже дуэль в чате
+    if chat_id in duel_state.duels:
+        await update.message.reply_text("⚠️ В этом чате уже идет дуэль! Подождите ее окончания.")
+        return
+    
+    # Проверяем, не идет ли уже бой с монстром
+    if chat_id in duel_state.monster_battles:
+        await update.message.reply_text("⚠️ В этом чате уже идет бой с монстром!")
+        return
+    
+    # Проверяем, находится ли пользователь в муте
+    if duel_state.is_muted(user_id):
+        remaining = (duel_state.user_mutes[user_id] - datetime.now()).seconds // 60
+        await update.message.reply_text(f"⏰ Вы не можете искать монстров, так как у вас мут еще на {remaining} минут!")
+        return
+
+    # Создаем монстра
+    monster = spawn_monster()
+    
+    if not monster:
+        await update.message.reply_text("❌ Не удалось создать монстра. Попробуйте еще раз!")
+        return
+
+    # Начинаем бой с монстром
+    duel_state.start_monster_battle(chat_id, user_id, monster)
+    
+    if monster.difficulty == "treasure":
+        # Обработка клада
+        coin_amount = random.randint(monster.config["coin_reward"][0], monster.config["coin_reward"][1])
+        data_store.add_coins(user_id, coin_amount)
+        data_store.add_monster_kill(user_id, "treasure")
+        
+        message = random.choice(MONSTER_MESSAGES["treasure"])
+        await update.message.reply_text(
+            f"{message}\n\n"
+            f"💰 Вы получили: 🪙 {coin_amount} монет!\n"
+            f"💎 Ваш баланс: 🪙 {data_store.get_user_data(user_id).coins} монет"
+        )
+        
+        # Завершаем бой
+        duel_state.end_monster_battle(chat_id)
+        return
+    
+    # Для обычных монстров
+    message = random.choice(MONSTER_MESSAGES["spawn"]).format(name=monster.name)
+    
+    difficulty_names = {
+        "common": "Обычный",
+        "rare": "Редкий",
+        "mythic": "Мифический",
+        "legendary": "Легендарный"
+    }
+    
+    await update.message.reply_text(
+        f"{message}\n\n"
+        f"📊 Сложность: {difficulty_names[monster.difficulty]}\n"
+        f"🎯 Шанс попадания монстра: {monster.accuracy}%\n"
+        f"🔄 Шанс уворота монстра: {monster.dodge}%\n\n"
+        f"⚔️ Бой начинается!"
+    )
+    
+    # Показываем интерфейс боя
+    await send_monster_battle_interface(chat_id, context.bot)
+
+
+async def search_monster_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки поиска монстра"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    
+    # Проверяем, не идет ли уже дуэль в чате
+    if chat_id in duel_state.duels:
+        await query.answer("⚠️ В этом чате уже идет дуэль!", show_alert=True)
+        return
+    
+    # Проверяем, не идет ли уже бой с монстром
+    if chat_id in duel_state.monster_battles:
+        await query.answer("⚠️ В этом чате уже идет бой с монстром!", show_alert=True)
+        return
+    
+    # Проверяем, находится ли пользователь в муте
+    if duel_state.is_muted(user_id):
+        remaining = (duel_state.user_mutes[user_id] - datetime.now()).seconds // 60
+        await query.answer(f"⏰ Вы не можете искать монстров, так как у вас мут еще на {remaining} минут!", show_alert=True)
+        return
+
+    # Создаем монстра
+    monster = spawn_monster()
+    
+    if not monster:
+        await query.answer("❌ Не удалось создать монстра. Попробуйте еще раз!", show_alert=True)
+        return
+
+    # Начинаем бой с монстром
+    duel_state.start_monster_battle(chat_id, user_id, monster)
+    
+    if monster.difficulty == "treasure":
+        # Обработка клада
+        coin_amount = random.randint(monster.config["coin_reward"][0], monster.config["coin_reward"][1])
+        data_store.add_coins(user_id, coin_amount)
+        data_store.add_monster_kill(user_id, "treasure")
+        
+        message = random.choice(MONSTER_MESSAGES["treasure"])
+        await query.edit_message_text(
+            f"{message}\n\n"
+            f"💰 Вы получили: 🪙 {coin_amount} монет!\n"
+            f"💎 Ваш баланс: 🪙 {data_store.get_user_data(user_id).coins} монет"
+        )
+        
+        # Завершаем бой
+        duel_state.end_monster_battle(chat_id)
+        return
+    
+    # Для обычных монстров
+    message = random.choice(MONSTER_MESSAGES["spawn"]).format(name=monster.name)
+    
+    difficulty_names = {
+        "common": "Обычный",
+        "rare": "Редкий",
+        "mythic": "Мифический",
+        "legendary": "Легендарный"
+    }
+    
+    await query.edit_message_text(
+        f"{message}\n\n"
+        f"📊 Сложность: {difficulty_names[monster.difficulty]}\n"
+        f"🎯 Шанс попадания монстра: {monster.accuracy}%\n"
+        f"🔄 Шанс уворота монстра: {monster.dodge}%\n\n"
+        f"⚔️ Бой начинается!"
+    )
+    
+    # Показываем интерфейс боя
+    await send_monster_battle_interface(chat_id, context.bot)
+
+
+async def send_monster_battle_interface(chat_id: int, bot):
+    """Отправляет интерфейс боя с монстром"""
+    if chat_id not in duel_state.monster_battles:
+        return
+    
+    battle_info = duel_state.monster_battles[chat_id]
+    monster = battle_info['monster']
+    user_id = battle_info['user_id']
+    
+    # Получаем информацию о пользователе
+    user_data = data_store.get_user_data(user_id)
+    current_weapon = WEAPONS.get(user_data.current_weapon, WEAPONS["standard_musket"])
+    
+    keyboard = []
+    
+    # Добавляем кнопки действий
+    if current_weapon.get('melee'):
+        # Кнопки для ближнего боя
+        keyboard.append([InlineKeyboardButton("⚔️ Атака", callback_data=f"monster_action_{chat_id}_attack")])
+        keyboard.append([InlineKeyboardButton("🎯 Прицелиться", callback_data=f"monster_action_{chat_id}_aim")])
+    else:
+        # Кнопки для дальнего боя
+        if battle_info['user_air_shots'] > 0 and not current_weapon.get('no_air_shot'):
+            keyboard.append([InlineKeyboardButton("🎈 Выстрел в воздух", callback_data=f"monster_action_{chat_id}_air")])
+        
+        if battle_info['user_aim'] < 10 and not current_weapon.get('no_aim'):
+            keyboard.append([InlineKeyboardButton("🎯 Прицелиться (+1)", callback_data=f"monster_action_{chat_id}_aim")])
+        
+        keyboard.append([InlineKeyboardButton("🔫 Стрелять", callback_data=f"monster_action_{chat_id}_shoot")])
+    
+    keyboard.append([InlineKeyboardButton("🏃‍♂️ Сбежать", callback_data=f"monster_action_{chat_id}_flee")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    status_text = (
+        f"👹 БОЙ С МОНСТРОМ\n\n"
+        f"🎯 Монстр: {monster.name} ({monster.difficulty})\n"
+        f"❤️ Жизней монстра: {monster.lives}\n"
+        f"🎯 Шанс попадания монстра: {monster.accuracy}%\n"
+        f"🔄 Шанс уворота монстра: {monster.dodge}%\n\n"
+        f"👤 Ваша статистика:\n"
+        f"❤️ Ваши жизни: {battle_info['user_lives']}\n"
+        f"🎯 Ваш прицел: {battle_info['user_aim']}/10\n"
+        f"🎈 Выстрелов в воздух: {battle_info['user_air_shots']}\n"
+        f"🔫 Оружие: {current_weapon['name']}\n\n"
+    )
+    
+    if monster.is_dodge_boosted:
+        status_text += f"⚠️ Монстр готов к увороту!\n"
+    if monster.is_accuracy_boosted:
+        status_text += f"⚠️ Точность монстра повышена!\n"
+    
+    status_text += f"\n⏱️ У вас 5 минут на ход..."
+    
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=status_text,
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        print(f"Ошибка отправки интерфейса монстра: {e}")
+
+
+async def handle_monster_action(query, context):
+    """Обработчик действий в бою с монстром"""
+    chat_id = int(query.data.split("_")[2])
+    action = query.data.split("_")[3]
+    
+    if chat_id not in duel_state.monster_battles:
+        await query.answer("⚠️ Бой уже завершен!", show_alert=True)
+        return
+    
+    battle_info = duel_state.monster_battles[chat_id]
+    monster = battle_info['monster']
+    
+    # Проверяем, что нажал тот же пользователь
+    if query.from_user.id != battle_info['user_id']:
+        await query.answer("❌ Это не ваш бой!", show_alert=True)
+        return
+    
+    # Обновляем время последнего действия
+    battle_info['last_action'] = datetime.now()
+    
+    user_data = data_store.get_user_data(battle_info['user_id'])
+    current_weapon = WEAPONS.get(user_data.current_weapon, WEAPONS["standard_musket"])
+    
+    if action == "flee":
+        # Пользователь сбегает
+        duel_state.end_monster_battle(chat_id)
+        await query.message.edit_text(
+            f"🏃‍♂️ Вы сбежали от {monster.name}!\n"
+            f"😔 Но это считается поражением..."
+        )
+        data_store.add_loss(battle_info['user_id'])
+        return
+    
+    # Обработка действий пользователя
+    if action == "air":
+        # Выстрел в воздух
+        if current_weapon.get('no_air_shot'):
+            await query.answer("❌ Это оружие не может стрелять в воздух!", show_alert=True)
+            return
+        
+        if battle_info['user_air_shots'] <= 0:
+            await query.answer("❌ У вас не осталось выстрелов в воздух!", show_alert=True)
+            return
+        
+        battle_info['user_air_shots'] -= 1
+        battle_info['user_lives'] += 1
+        battle_info['user_accuracy_modifier'] *= 0.9
+        
+        await query.message.edit_text(
+            f"🎈 Вы сделали выстрел в воздух! +1 жизнь\n\n"
+            f"Теперь ходит монстр..."
+        )
+        
+        # Ход монстра
+        await monster_turn(chat_id, context.bot, query.message)
+        return
+    
+    elif action == "aim":
+        # Прицеливание
+        if current_weapon.get('no_aim'):
+            await query.answer("❌ Это оружие не может прицеливаться!", show_alert=True)
+            return
+        
+        if battle_info['user_aim'] < 10:
+            battle_info['user_aim'] += 1
+        
+        await query.message.edit_text(
+            f"🎯 Вы прицелились! Текущий прицел: {battle_info['user_aim']}/10\n\n"
+            f"Теперь ходит монстр..."
+        )
+        
+        # Ход монстра
+        await monster_turn(chat_id, context.bot, query.message)
+        return
+    
+    elif action == "shoot" or action == "attack":
+        # Атака пользователя
+        await handle_user_attack(chat_id, context.bot, query)
+        return
+
+
+async def handle_user_attack(chat_id: int, bot, query):
+    """Обработка атаки пользователя на монстра"""
+    battle_info = duel_state.monster_battles[chat_id]
+    monster = battle_info['monster']
+    user_id = battle_info['user_id']
+    
+    user_data = data_store.get_user_data(user_id)
+    current_weapon = WEAPONS.get(user_data.current_weapon, WEAPONS["standard_musket"])
+    
+    # Определяем точность пользователя
+    if current_weapon.get('fixed_accuracy'):
+        accuracy = current_weapon['fixed_accuracy']
+    elif query.from_user.username and query.from_user.username.lower() == "bi1ro":
+        accuracy_table = SPECIAL_ACCURACY
+        user_aim = battle_info['user_aim']
+        accuracy = accuracy_table.get(min(user_aim, 5), 100)
+    else:
+        accuracy_table = NORMAL_ACCURACY
+        user_aim = battle_info['user_aim']
+        accuracy = accuracy_table.get(min(user_aim, 10), 100)
+    
+    # Применяем модификатор
+    accuracy_modifier = battle_info['user_accuracy_modifier']
+    final_accuracy = accuracy * accuracy_modifier
+    
+    # Проверяем уворот монстра
+    dodge_chance = monster.dodge
+    if monster.is_dodge_boosted:
+        dodge_chance = monster.config["max_dodge"]
+    
+    dodged = random.randint(1, 100) <= dodge_chance
+    
+    if dodged:
+        # Монстр уворачивается
+        message = random.choice(MONSTER_MESSAGES["dodge"]).format(name=monster.name)
+        await query.message.edit_text(
+            f"{message}\n\n"
+            f"Теперь ходит монстр..."
+        )
+        
+        # Сбрасываем усиленный уворот
+        if monster.is_dodge_boosted:
+            monster.is_dodge_boosted = False
+            monster.dodge = monster.config["base_dodge"]
+        
+        # Ход монстра
+        await monster_turn(chat_id, bot, query.message)
+        return
+    
+    # Проверяем попадание
+    hit = random.randint(1, 100) <= final_accuracy
+    
+    if not hit:
+        # Промах
+        await query.message.edit_text(
+            f"🌬️ Вы промахнулись по {monster.name}!\n\n"
+            f"Теперь ходит монстр..."
+        )
+        
+        # Эффекты при промахе
+        if current_weapon.get('miss_bonus'):
+            battle_info['user_accuracy_modifier'] *= current_weapon['miss_bonus']
+        
+        # Ход монстра
+        await monster_turn(chat_id, bot, query.message)
+        return
+    
+    # ПОПАДАНИЕ
+    # Проверяем игнорирование дополнительных жизней
+    ignore_extra_lives = current_weapon.get('ignore_extra_lives', False)
+    
+    # Наносим урон монстру
+    monster.lives -= 1
+    
+    result_text = f"💥 Вы попали в {monster.name}!"
+    
+    # Для некоторых оружий - эффекты при попадании
+    if current_weapon.get('gain_life_on_hit'):
+        battle_info['user_lives'] += 1
+        result_text += f"\n➕ Вы получаете дополнительную жизнь!"
+    
+    # Сбрасываем прицел после выстрела
+    battle_info['user_aim'] = 0
+    
+    await query.message.edit_text(result_text)
+    
+    # Проверяем, не убит ли монстр
+    if monster.lives <= 0:
+        await end_monster_battle(chat_id, bot, user_id, monster, True)
+    else:
+        # Ход монстра
+        await monster_turn(chat_id, bot, query.message)
+
+
+async def monster_turn(chat_id: int, bot, message):
+    """Ход монстра"""
+    if chat_id not in duel_state.monster_battles:
+        return
+    
+    battle_info = duel_state.monster_battles[chat_id]
+    monster = battle_info['monster']
+    user_id = battle_info['user_id']
+    
+    # Монстр может повысить точность
+    if not monster.is_accuracy_boosted:
+        if random.randint(1, 100) <= monster.config.get("accuracy_boost_chance", 0):
+            monster.accuracy = min(monster.accuracy + 5, monster.config["max_accuracy"])
+            monster.is_accuracy_boosted = True
+    
+    # Монстр может подготовиться к увороту
+    if not monster.is_dodge_boosted:
+        if random.randint(1, 100) <= monster.config.get("dodge_boost_chance", 0):
+            monster.is_dodge_boosted = True
+    
+    # Монстр атакует
+    if random.randint(1, 100) <= monster.config.get("attack_chance", 50):
+        attack_message = random.choice(MONSTER_MESSAGES["attack"]).format(name=monster.name)
+        
+        # Определяем шанс попадания монстра
+        monster_accuracy = monster.accuracy
+        if monster.is_accuracy_boosted:
+            monster_accuracy = monster.config["max_accuracy"]
+        
+        # Проверяем попадание
+        hit = random.randint(1, 100) <= monster_accuracy
+        
+        if hit:
+            # Особые способности монстров
+            if monster.difficulty == "rare" and random.randint(1, 100) <= monster.config.get("steal_life_chance", 0):
+                # Крадет жизнь у игрока
+                if battle_info['user_lives'] > 1:
+                    battle_info['user_lives'] -= 1
+                    monster.has_extra_life = True
+                    attack_message += f"\n😱 {monster.name} крадет у вас жизнь!"
+                else:
+                    battle_info['user_lives'] -= 1
+                    attack_message += f"\n💥 {monster.name} попадает в вас!"
+            elif monster.difficulty == "mythic" and random.randint(1, 100) <= monster.config.get("knockdown_chance", 0):
+                # Валяет врага и добавляет себе жизнь
+                battle_info['user_lives'] -= 1
+                monster.lives += 1
+                attack_message += f"\n🤕 {monster.name} валит вас с ног и добавляет себе жизнь!"
+            elif monster.difficulty == "legendary" and random.randint(1, 100) <= monster.config.get("steal_life_chance", 0):
+                # Сбивает прицел, валит с ног и крадет жизнь
+                battle_info['user_aim'] = 0
+                battle_info['user_lives'] -= 1
+                
+                if battle_info['user_lives'] > 0:
+                    monster.has_extra_life = True
+                    battle_info['user_lives'] -= 1
+                    attack_message += f"\n😈 {monster.name} сбивает ваш прицел, валит с ног и крадет жизнь!"
+                else:
+                    monster.lives += 1
+                    attack_message += f"\n😈 {monster.name} сбивает ваш прицел, валит с ног и добавляет себе жизнь!"
+            else:
+                # Обычная атака
+                battle_info['user_lives'] -= 1
+                attack_message += f"\n💥 {monster.name} попадает в вас!"
+        else:
+            attack_message += f"\n🌬️ {monster.name} промахивается!"
+    else:
+        attack_message = f"{monster.name} не атакует в этот ход."
+    
+    # Сбрасываем усиления после хода
+    if monster.is_dodge_boosted:
+        monster.is_dodge_boosted = False
+        monster.dodge = monster.config["base_dodge"]
+    
+    if monster.is_accuracy_boosted:
+        monster.is_accuracy_boosted = False
+        monster.accuracy = monster.config["base_accuracy"]
+    
+    await message.edit_text(f"{attack_message}\n\nВаш ход...")
+    
+    # Проверяем, не погиб ли игрок
+    if battle_info['user_lives'] <= 0:
+        await end_monster_battle(chat_id, bot, user_id, monster, False)
+    else:
+        # Обновляем интерфейс для хода пользователя
+        await send_monster_battle_interface(chat_id, bot)
+
+
+async def end_monster_battle(chat_id: int, bot, user_id: int, monster: Monster, user_won: bool):
+    """Завершает бой с монстром"""
+    if chat_id not in duel_state.monster_battles:
+        return
+    
+    duel_state.end_monster_battle(chat_id)
+    
+    if user_won:
+        # Пользователь победил
+        coin_reward = random.randint(monster.config["coin_reward"][0], monster.config["coin_reward"][1])
+        data_store.add_coins(user_id, coin_reward)
+        data_store.add_monster_kill(user_id, monster.difficulty)
+        data_store.add_win(user_id)
+        
+        difficulty_names = {
+            "common": "обычного",
+            "rare": "редкого",
+            "mythic": "мифического",
+            "legendary": "легендарного"
+        }
+        
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🏆 ПОБЕДА!\n\n"
+                f"Вы победили {monster.name} ({difficulty_names[monster.difficulty]} монстра)!\n"
+                f"💰 Награда: 🪙 {coin_reward} монет\n"
+                f"💎 Ваш баланс: 🪙 {data_store.get_user_data(user_id).coins} монет\n\n"
+                f"🎯 Убийств {difficulty_names[monster.difficulty]}: {data_store.get_user_data(user_id).monster_kills[monster.difficulty]}"
+            )
+        )
+    else:
+        # Пользователь проиграл
+        data_store.add_loss(user_id)
+        
+        if duel_state.mute_enabled:
+            mute_duration = duel_state.mute_duration_minutes
+            user_name = format_username(await bot.get_chat(user_id))
+            
+            # Применяем мут
+            duel_state.user_mutes[user_id] = datetime.now() + timedelta(minutes=mute_duration)
+            
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"💀 ПОРАЖЕНИЕ!\n\n"
+                    f"{monster.name} победил вас!\n"
+                    f"⏰ Вы получаете мут на {mute_duration} минут за поражение!"
+                )
+            )
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"💀 ПОРАЖЕНИЕ!\n\n"
+                    f"{monster.name} победил вас!\n"
+                    f"🟢 Система мута отключена - вы не получили мут."
+                )
+            )
 
 
 async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -434,11 +1156,18 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Всего поражений: {user_data.total_losses}\n"
         f"Монет: 🪙 {user_data.coins}\n\n"
         f"🎯 Текущее оружие: {current_weapon['name']}\n"
-        f"📦 Оружий в коллекции: {len(user_data.weapons)}"
+        f"📦 Оружий в коллекции: {len(user_data.weapons)}\n\n"
+        f"👹 **СТАТИСТИКА МОНСТРОВ**\n"
+        f"• Обычных убито: {user_data.monster_kills['common']}\n"
+        f"• Редких убито: {user_data.monster_kills['rare']}\n"
+        f"• Мифических убито: {user_data.monster_kills['mythic']}\n"
+        f"• Легендарных убито: {user_data.monster_kills['legendary']}\n"
+        f"• Кладов найдено: {user_data.monster_kills['treasure']}"
     )
 
     keyboard = [
         [InlineKeyboardButton("🛒 Магазин", callback_data="shop_main")],
+        [InlineKeyboardButton("👹 Поиск монстра", callback_data="search_monster")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -849,6 +1578,13 @@ async def guide_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - Ходы делаются по очереди
 - Дуэль заканчивается при потере всех жизней
 
+👹 **БОЙ С МОНСТРАМИ:**
+• Используйте команду `/monster` или кнопку "Поиск монстра"
+• 5 типов встреч: Обычный, Редкий, Мифический, Легендарный, Клад
+• Каждый монстр имеет уникальные характеристики
+• Победа над монстром дает награду в монетах
+• Поражение от монстра дает мут (если включен)
+
 💡 **Совет:** Используйте выстрелы в воздух для дополнительных жизней, но помните, что точность снижается после каждого!
     """
 
@@ -877,6 +1613,9 @@ async def back_to_main_callback(update: Update, context: ContextTypes.DEFAULT_TY
         [
             InlineKeyboardButton("📖 Руководство", callback_data="guide"),
             InlineKeyboardButton("👤 Профиль", callback_data="profile")
+        ],
+        [
+            InlineKeyboardButton("👹 Поиск монстра", callback_data="search_monster")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -979,6 +1718,11 @@ async def handle_duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Проверяем, не идет ли уже дуэль в этом чате
     if chat_id in duel_state.duels:
         await update.message.reply_text("⚠️ В этом чате уже идет дуэль!")
+        return
+    
+    # Проверяем, не идет ли уже бой с монстром в этом чате
+    if chat_id in duel_state.monster_battles:
+        await update.message.reply_text("⚠️ В этом чате уже идет бой с монстром!")
         return
 
     # Проверяем, не находится ли кто-то в муте
@@ -1153,6 +1897,10 @@ async def duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await buy_weapon_callback(update, context)
     elif data.startswith("confirm_buy_"):
         await confirm_buy_callback(update, context)
+    elif data == "search_monster":
+        await search_monster_callback(update, context)
+    elif data.startswith("monster_action_"):
+        await handle_monster_action(query, context)
 
 
 async def handle_duel_accept(query, context):
@@ -1385,7 +2133,7 @@ async def handle_duel_action(query, context):
             # Отмена дуэли
             duel_state.duels.pop(chat_id)
             duel_state.clear_weapon_effects(chat_id)
-            await query.message.edit_text(f"🏳️ {shooter_name} прекратил бой!")
+            await query.message.edit_text(f"🏳️ {shooter_name} прекратил бой! Дуэль отменена.")
             return
     else:
         # Обработка действий для дальнего боя
@@ -1789,7 +2537,7 @@ async def handle_knockdown(chat_id: int, shooter, target, query, context):
     shooter_name = format_username(shooter)
     target_name = format_username(target)
 
-    # Помечаем, что сбивание с ног использовано
+    # Помечаем, что сбивание с ног использован
     weapon_effects = duel_state.get_weapon_effect(chat_id, shooter.id)
     weapon_effects['knockdown_used'] = True
 
@@ -1811,7 +2559,7 @@ async def handle_alert(chat_id: int, shooter, query, context):
     duel_info = duel_state.duels[chat_id]
     shooter_name = format_username(shooter)
 
-    # Помечаем, что настороженность использована
+    # Помечаем, что настороженность использован
     weapon_effects = duel_state.get_weapon_effect(chat_id, shooter.id)
     weapon_effects['alert_used'] = True
 
@@ -1978,19 +2726,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Всего поражений: {user_data.total_losses}\n"
                 f"Монет: 🪙 {user_data.coins}\n\n"
                 f"🎯 Текущее оружие: {current_weapon['name']}\n"
-                f"📦 Оружий в коллекции: {len(user_data.weapons)}"
+                f"📦 Оружий в коллекции: {len(user_data.weapons)}\n\n"
+                f"👹 **СТАТИСТИКА МОНСТРОВ**\n"
+                f"• Обычных убито: {user_data.monster_kills['common']}\n"
+                f"• Редких убито: {user_data.monster_kills['rare']}\n"
+                f"• Мифических убито: {user_data.monster_kills['mythic']}\n"
+                f"• Легендарных убито: {user_data.monster_kills['legendary']}\n"
+                f"• Кладов найдено: {user_data.monster_kills['treasure']}"
             )
 
             keyboard = [
-                [InlineKeyboardButton("🛒 Магазин", callback_data="shop_main")]
+                [InlineKeyboardButton("🛒 Магазин", callback_data="shop_main")],
+                [InlineKeyboardButton("👹 Поиск монстра", callback_data="search_monster")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             await update.message.reply_text(profile_text, reply_markup=reply_markup, parse_mode='Markdown')
 
+        # Обработка команды !поискмонстра
+        elif text == "!поискмонстра":
+            # Создаем временный callback запрос для поиска монстра
+            class MockQuery:
+                def __init__(self, update):
+                    self.callback_query = None
+                    self.message = update.message
+                    self.from_user = update.message.from_user
+                    self.data = "search_monster"
+                    
+                async def answer(self, *args, **kwargs):
+                    pass
+                    
+                async def edit_message_text(self, *args, **kwargs):
+                    await self.message.reply_text(*args, **kwargs)
+            
+            mock_query = MockQuery(update)
+            await search_monster_callback(mock_query, context)
+
         # Обработка ввода времени мута
         elif context.user_data.get('awaiting_mute_input'):
             await handle_mute_input(update, context)
+
+
+async def start_background_tasks(context):
+    """Запуск фоновых задач после инициализации бота"""
+    bot = context.bot
+    print(f"✅ Бот @{bot.username} успешно подключен!")
+    print(
+        f"🔗 Ссылка для добавления в чат: https://t.me/{bot.username}?startgroup=true&admin=post_messages+delete_messages+restrict_members")
+    # Запускаем задачу проверки неактивных дуэлей
+    asyncio.create_task(check_inactive_duels(bot))
+    # Запускаем задачу проверки неактивных боев с монстрами
+    asyncio.create_task(check_inactive_monster_battles(bot))
 
 
 async def check_inactive_duels(bot):
@@ -2020,6 +2806,31 @@ async def check_inactive_duels(bot):
             duel_state.duels.pop(chat_id, None)
 
 
+async def check_inactive_monster_battles(bot):
+    """Проверяет неактивные бои с монстрами"""
+    while True:
+        await asyncio.sleep(60)  # Проверка каждую минуту
+
+        now = datetime.now()
+        battles_to_remove = []
+
+        for chat_id, battle_info in duel_state.monster_battles.items():
+            if battle_info['state'] == 'active' and 'last_action' in battle_info:
+                if (now - battle_info['last_action']).total_seconds() > 300:  # 5 минут
+                    battles_to_remove.append(chat_id)
+
+                    try:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=f"⏰ Бой с монстром автоматически прекращен из-за бездействия!"
+                        )
+                    except:
+                        pass
+
+        for chat_id in battles_to_remove:
+            duel_state.end_monster_battle(chat_id)
+
+
 def main():
     """Основная функция"""
     # Создаем приложение
@@ -2027,6 +2838,7 @@ def main():
 
     # Добавляем обработчики команд
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("monster", monster_command))
 
     # Добавляем обработчик для проверки мута перед всеми сообщениями
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, check_message_for_mute), group=-1)
@@ -2037,22 +2849,16 @@ def main():
     # Добавляем обработчик сообщений (команда !дуэль и ввод мута)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Запускаем фоновую задачу проверки неактивных дуэлей через job_queue
+    application.job_queue.run_once(start_background_tasks, when=0)
+
     # Запускаем бота
     print("🤖 Бот запущен и готов к дуэлям!")
     print("⚔️ Для вызова на дуэль: ответьте на сообщение командой '!дуэль'")
     print("👤 Для просмотра профиля: !дуэльныйпрофиль")
+    print("👹 Для поиска монстра: /monster, !поискмонстра или кнопка 'Поиск монстра'")
     print("🛒 Магазин оружия доступен через профиль")
     print("⏳ Идет подключение к Telegram...")
-    
-    # Запускаем фоновую задачу проверки неактивных дуэлей
-    application.create_task = asyncio.create_task
-    # Запускаем задачу в фоне
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        asyncio.create_task(check_inactive_duels(application.bot))
-    else:
-        loop.run_until_complete(check_inactive_duels(application.bot))
-    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
